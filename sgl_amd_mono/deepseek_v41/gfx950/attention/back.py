@@ -69,6 +69,7 @@ from .plan import (
     WOA_ROWS,
     Dims,
     cdiv,
+    k2_chunk_keys,
     tile_rows,
     token_tiles,
 )
@@ -104,8 +105,8 @@ def head_groups(d: Dims, s: int) -> int:
 
 
 def chunk_keys(d: Dims, s: int) -> int:
-    """A split unit's keys: a 16-key tile a wave of a head group."""
-    return 16 * (WAVES // head_groups(d, s))
+    """A split unit's keys; plan.back_scratch sizes K2's scratch with the same value."""
+    return k2_chunk_keys(d, s)
 
 
 def p_row(d: Dims, s: int) -> int:

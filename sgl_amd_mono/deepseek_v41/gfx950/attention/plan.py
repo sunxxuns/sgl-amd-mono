@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """K1 and K2 attention geometry and scratch layout."""
 
+import os
+
 import msgspec
+
+from sgl_amd_mono.common.plan import BLOCKS, WAVES
 
 HIDDEN = 5120
 Q_RANK = 1280
@@ -37,6 +41,17 @@ def cdiv(a, b):
 
 def round_up(a, b):
     return cdiv(a, b) * b
+
+
+def k2_split_multiplier(s: int) -> int:
+    value = os.environ.get(
+        "SGLANG_AMD_MONO_K2_ATTN_SPLIT_MULT",
+        "2" if s in (4, 8, 12) else "1",
+    )
+    multiplier = int(value)
+    if multiplier < 1:
+        raise ValueError("SGLANG_AMD_MONO_K2_ATTN_SPLIT_MULT must be positive")
+    return multiplier
 
 
 class Dims(msgspec.Struct, frozen=True):
@@ -81,6 +96,17 @@ class Dims(msgspec.Struct, frozen=True):
     @property
     def wob_tasks(self) -> int:
         return HIDDEN // ROWS  # 320
+
+
+def k2_chunk_keys(d: Dims, s: int) -> int:
+    groups = 2 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= BLOCKS else 1
+    keys = 16 * (WAVES // groups)
+    multiplier = k2_split_multiplier(s)
+    if keys % multiplier:
+        raise ValueError(
+            "SGLANG_AMD_MONO_K2_ATTN_SPLIT_MULT does not divide the K2 chunk"
+        )
+    return keys // multiplier
 
 
 WQKV_TASKS = QKV_ROWS // ROWS  # 112
@@ -133,8 +159,7 @@ def front_scratch(s: int, d: Dims) -> dict:
 
 def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
     """Return K2's scratch regions past ``start`` -> (byte offset, bytes)."""
-    # must match back.chunk_keys
-    ck = 64 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= 256 else 128
+    ck = k2_chunk_keys(d, s)
     nchunk = cdiv(KEYS, ck)
     return byte_layout(
         [
