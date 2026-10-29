@@ -100,7 +100,7 @@ DOWN_TASKS = HIDDEN // ROWS
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
 DOWN_CHAINS = 3
-PIPE_WIDTHS = (4, 8, 16)
+PIPE_WIDTHS = (4, 8, 12, 16)
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS
