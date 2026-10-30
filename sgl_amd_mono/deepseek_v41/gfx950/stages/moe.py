@@ -99,8 +99,9 @@ DOWN_TASKS = HIDDEN // ROWS
 # (task, slot) scale blocks a down wave holds a round: at 4 the wave spills
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
-DOWN_CHAINS = 3
-PIPE_WIDTHS = (4, 8, 12, 16, 20)
+DOWN_CHAINS = 2
+# a down slot of this many K steps or more spills unpipelined (TP2: 9 steps); below it (TP4: 5) the pipeline only adds latency
+PIPE_MIN_STEPS = 8
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS
@@ -961,7 +962,8 @@ def stage_down(c, tasks):
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
     # round r + 1's loads go out while round r multiplies, round 0's before the shared down
-    loads = down_weights(c, tasks, 0, slots, nu, weights=s not in PIPE_WIDTHS)
+    pipe = d.inter // 128 >= PIPE_MIN_STEPS
+    loads = down_weights(c, tasks, 0, slots, nu, weights=not pipe)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
     for rnd in range(0, rounds, 1):
@@ -975,10 +977,10 @@ def stage_down(c, tasks):
         mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
         for q in range_constexpr(len(svs)):
             scale_block_store(c, svs[q], sl + q * sw)
-        loads = down_weights(c, tasks, rnd + 1, slots, nu, weights=s not in PIPE_WIDTHS)
+        loads = down_weights(c, tasks, rnd + 1, slots, nu, weights=not pipe)
         for i in range_constexpr(slots):
             for j in range_constexpr(n):
-                if const_expr(s in PIPE_WIDTHS):
+                if const_expr(pipe):
                     wptr = fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
                     down_mfma_pipelined(
                         c,
@@ -1010,7 +1012,7 @@ def stage_down(c, tasks):
                     if j0 < counts[i]:
                         more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
                         for j in range_constexpr(n):
-                            if const_expr(s in PIPE_WIDTHS):
+                            if const_expr(pipe):
                                 wptr = (
                                     fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
                                 )
