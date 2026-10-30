@@ -100,6 +100,8 @@ DOWN_TASKS = HIDDEN // ROWS
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
 DOWN_CHAINS = 2
+# a down slot of this many K steps or more spills unpipelined (TP2: 9 steps); below it (TP4: 5) the pipeline only adds latency
+PIPE_MIN_STEPS = 8
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
 RED_TASKS = HIDDEN // RED_COLS
@@ -960,11 +962,12 @@ def stage_down(c, tasks):
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
     # round r + 1's loads go out while round r multiplies, round 0's before the shared down
-    loads = down_weights(c, tasks, 0, slots, nu)
+    pipe = d.inter // 128 >= PIPE_MIN_STEPS
+    loads = down_weights(c, tasks, 0, slots, nu, weights=not pipe)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
     for rnd in range(0, rounds, 1):
-        svs, avs = loads
+        svs, avs, es = loads
         us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
         ucs = [fx.min(u, nu - 1) for u in us]
         firsts = [c["rs"].slot_first(tab, u) for u in ucs]
@@ -974,37 +977,69 @@ def stage_down(c, tasks):
         mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
         for q in range_constexpr(len(svs)):
             scale_block_store(c, svs[q], sl + q * sw)
-        loads = down_weights(c, tasks, rnd + 1, slots, nu)
+        loads = down_weights(c, tasks, rnd + 1, slots, nu, weights=not pipe)
         for i in range_constexpr(slots):
             for j in range_constexpr(n):
-                down_mfma(
-                    c,
-                    j,
-                    tasks[j],
-                    sl + (j * slots + i) * sw,
-                    mids[i],
-                    firsts[i],
-                    counts[i],
-                    avs[j * slots + i],
-                    us[i] < nu,
-                )
+                if const_expr(pipe):
+                    wptr = fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
+                    down_mfma_pipelined(
+                        c,
+                        j,
+                        tasks[j],
+                        sl + (j * slots + i) * sw,
+                        mids[i],
+                        firsts[i],
+                        counts[i],
+                        es[j * slots + i],
+                        us[i] < nu,
+                        wptr,
+                    )
+                else:
+                    down_mfma(
+                        c,
+                        j,
+                        tasks[j],
+                        sl + (j * slots + i) * sw,
+                        mids[i],
+                        firsts[i],
+                        counts[i],
+                        avs[j * slots + i],
+                        us[i] < nu,
+                    )
             # a slot of more than 16 picks: its next pick tile's rows
             if const_expr(s > TILE):
                 for j0 in range_constexpr(TILE, s, TILE):
                     if j0 < counts[i]:
                         more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
                         for j in range_constexpr(n):
-                            down_mfma(
-                                c,
-                                j,
-                                tasks[j],
-                                sl + (j * slots + i) * sw,
-                                more,
-                                firsts[i] + j0,
-                                counts[i] - j0,
-                                avs[j * slots + i],
-                                us[i] < nu,
-                            )
+                            if const_expr(pipe):
+                                wptr = (
+                                    fx.recast_iter(fx.Int32, c["red"]) + c["wave"] * 512
+                                )
+                                down_mfma_pipelined(
+                                    c,
+                                    j,
+                                    tasks[j],
+                                    sl + (j * slots + i) * sw,
+                                    more,
+                                    firsts[i] + j0,
+                                    counts[i] - j0,
+                                    es[j * slots + i],
+                                    us[i] < nu,
+                                    wptr,
+                                )
+                            else:
+                                down_mfma(
+                                    c,
+                                    j,
+                                    tasks[j],
+                                    sl + (j * slots + i) * sw,
+                                    more,
+                                    firsts[i] + j0,
+                                    counts[i] - j0,
+                                    avs[j * slots + i],
+                                    us[i] < nu,
+                                )
     gpu.barrier()
     for t0, nn in token_tiles(s):
         for j in range_constexpr(n):
@@ -1023,7 +1058,7 @@ def take_down_rank(c):
     return fx.ptr_load(c["tab"] + c["rs"].queue0)
 
 
-def down_weights(c, tasks, rnd, slots, nu):
+def down_weights(c, tasks, rnd, slots, nu, weights=True):
     """Issue ``stage_down`` round ``rnd``'s scale and weight loads; a slot past U reloads the last."""
     s, wave, tab, a, d = c["S"], c["wave"], c["tab"], c["args"], c["d"]
     us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
@@ -1033,14 +1068,19 @@ def down_weights(c, tasks, rnd, slots, nu):
         for task in tasks
         for e in es
     ]
-    avs = [
-        fp4_tile_weights(
-            c, a["w2"], e, HIDDEN, d.inter, task, 0, d.inter // 128, d.inter_real
-        )
-        for task in tasks
-        for e in es
-    ]
-    return svs, avs
+    all_es = [e for task in tasks for e in es]
+    avs = (
+        [
+            fp4_tile_weights(
+                c, a["w2"], e, HIDDEN, d.inter, task, 0, d.inter // 128, d.inter_real
+            )
+            for task in tasks
+            for e in es
+        ]
+        if weights
+        else []
+    )
+    return svs, avs, all_es
 
 
 def mid_operands(c, first, count):
@@ -1206,6 +1246,43 @@ def down_mfma(c, j, task, sl, mid, first, count, av, live):
     for i in range_constexpr(len(av)):
         h = i % DOWN_CHAINS
         accs[h] = mfma_scaled(av[i], bvs[i], accs[h], sas[i], sbs[i], FP4, FP8)
+    acc = accs[0]
+    for h in range_constexpr(1, DOWN_CHAINS):
+        acc = acc + accs[h]
+    pick = c["rs"].pick_at(tab, first + col)
+    for q in range_constexpr(4):
+        r = 4 * (lane // 16) + q
+        if live & (jj < count):
+            contrib_store(c, j, pick * 16 + r, acc[q])
+
+
+@flyc.jit
+def down_mfma_pipelined(c, j, task, sl, mid, first, count, e, live, wptr):
+    lane, tab, d = c["lane"], c["tab"], c["d"]
+    sas = lds_scales(
+        sl, task % 2 * 16 + lane % 16, lane, 0, d.inter // 128, d.down_scale_cols
+    )
+    jj = lane % 16
+    col = fx.min(jj, count - 1)
+    bvs, sbs = mid
+    steps = d.inter // 128
+    v = fp4_tile_weights(
+        c, c["args"]["w2"], e, HIDDEN, d.inter, task, 0, 1, d.inter_real
+    )[0]
+    fx.ptr_store(v, wptr + lane * 4)
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(DOWN_CHAINS)]
+    for i in range_constexpr(steps):
+        if const_expr(i + 1 < steps):
+            v = fp4_tile_weights(
+                c, c["args"]["w2"], e, HIDDEN, d.inter, task, i + 1, 1, d.inter_real
+            )[0]
+            fx.ptr_store(v, wptr + ((i + 1) % 2) * 256 + lane * 4)
+        av = fx.ptr_load(
+            wptr + (i % 2) * 256 + lane * 4,
+            result_type=fx.Vector.make_type(4, fx.Int32),
+        )
+        h = i % DOWN_CHAINS
+        accs[h] = mfma_scaled(av, bvs[i], accs[h], sas[i], sbs[i], FP4, FP8)
     acc = accs[0]
     for h in range_constexpr(1, DOWN_CHAINS):
         acc = acc + accs[h]
