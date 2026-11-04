@@ -964,6 +964,7 @@ class _Built:
             and getattr(sampling_info, "grammar_mask", None) is None
             and getattr(sampling_info, "logit_bias", None) is None
             and getattr(sampling_info, "acc_linear_penalties", None) is None
+            and hidden.shape[0] <= 48
         )
         try:
             return lp(
