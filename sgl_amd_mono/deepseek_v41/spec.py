@@ -954,14 +954,29 @@ class _Built:
         if lm.capture_aux_hidden_states:
             out, aux = out
         hidden, pre_hc_head = out
-        return lm.logits_processor(
-            input_ids,
-            hidden,
-            lm.lm_head,
-            forward_batch,
-            aux,
-            hidden_states_before_norm=None if aux is not None else pre_hc_head,
+        lp = lm.logits_processor
+        sampling_info = getattr(forward_batch, "sampling_info", None)
+        lp._amd_mono_top1_verify = bool(
+            forward_batch.forward_mode.is_target_verify()
+            and not getattr(forward_batch, "return_logprob", False)
+            and (sampling_info is None or sampling_info.is_all_greedy)
+            and not getattr(sampling_info, "has_custom_logit_processor", False)
+            and getattr(sampling_info, "grammar_mask", None) is None
+            and getattr(sampling_info, "logit_bias", None) is None
+            and getattr(sampling_info, "acc_linear_penalties", None) is None
+            and hidden.shape[0] <= 48
         )
+        try:
+            return lp(
+                input_ids,
+                hidden,
+                lm.lm_head,
+                forward_batch,
+                aux,
+                hidden_states_before_norm=None if aux is not None else pre_hc_head,
+            )
+        finally:
+            lp._amd_mono_top1_verify = False
 
     def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
         """``DeepseekV4Model.forward``: the embedding, each layer as K1 and K2,
@@ -1201,6 +1216,13 @@ def _build(model, hf_config, ctx) -> _Built:
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
         runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
+    from sgl_amd_mono.deepseek_v41.gfx950.lm_head_top1 import lm_head_top1, warmup
+
+    lp = model.logits_processor
+    lp._amd_mono_top1_fn = lambda hidden, weight: lm_head_top1(
+        hidden, weight, p.tp_rank * weight.shape[0]
+    )
+    warmup(model.lm_head.weight)
     return _Built(model, runner, layers)
 
 
